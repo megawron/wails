@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"image"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/leaanthony/winicon"
@@ -95,10 +97,88 @@ func packageApplicationForDarwin(options *Options) error {
 		return err
 	}
 
-	// Generate App Icon
-	err = processDarwinIcon(options.ProjectData, "appicon", resourceDir, "iconfile")
-	if err != nil {
-		return err
+	// Icon Handling Strategy
+	// 1. Pre-compiled Assets.car (CI/CD Optimization)
+	// 2. Local .icon bundle (Liquid Glass Support)
+	// 3. Legacy iconfile.icns (Standard fallback)
+
+	var iconName string
+	var useLiquidGlass bool
+
+	// Check 1: Pre-compiled Assets.car
+	precompiledCarPath := buildassets.GetLocalPath(options.ProjectData, "appicon.car")
+	if fs.FileExists(precompiledCarPath) {
+		tgtBundle := filepath.Join(resourceDir, "Assets.car")
+		err := fs.CopyFile(precompiledCarPath, tgtBundle)
+		if err != nil {
+			return err
+		}
+		useLiquidGlass = true
+		iconName = BundledAppIconName // Always AppIcon
+	}
+
+	// Check 2: Local .icon bundle (if not already handled)
+	if !useLiquidGlass {
+		files, _ := os.ReadDir(buildassets.GetLocalPath(options.ProjectData, "."))
+		for _, f := range files {
+			if f.IsDir() && strings.HasSuffix(f.Name(), ".icon") {
+				iconBundlePath := buildassets.GetLocalPath(options.ProjectData, f.Name())
+
+				// Strategy: Enforce "AppIcon" as the internal asset name.
+				// actool uses the folder name as the asset name.
+				// To ensure consistency (especially for CI artifacts which default to AppIcon),
+				// we copy the user's bundle to a temp "AppIcon.icon" folder and compile that.
+
+				tmpDir, err := os.MkdirTemp("", "wails-icon-build-*")
+				if err != nil {
+					return errors.Wrap(err, "Failed to create temp dir for icon build")
+				}
+				defer os.RemoveAll(tmpDir) // Clean up
+
+				tmpBundlePath := filepath.Join(tmpDir, "AppIcon.icon")
+				err = fs.CopyDir(iconBundlePath, tmpBundlePath)
+				if err != nil {
+					return errors.Wrap(err, "Failed to copy icon bundle to temp dir")
+				}
+
+				// Compile the temp bundle (which is named AppIcon.icon)
+				err = compileAssetsCar(tmpBundlePath, resourceDir, BundledAppIconName)
+				if err == nil {
+					useLiquidGlass = true
+					iconName = BundledAppIconName
+
+					// Auto-Save for CI: Copy generated Assets.car to build/appicon.car
+					ciArtifactPath := buildassets.GetLocalPath(options.ProjectData, "appicon.car")
+
+					srcArtifact := filepath.Join(resourceDir, "Assets.car")
+					if copyErr := fs.CopyFile(srcArtifact, ciArtifactPath); copyErr != nil && options.Verbosity > 0 {
+						println("WARNING: Failed to auto-save CI artifact to build/appicon.car: " + copyErr.Error())
+					} else if options.Verbosity > 0 {
+						println("NOTE: Generated CI artifact at build/appicon.car")
+					}
+
+				} else if options.Verbosity > 0 {
+					println("WARNING: Failed to compile .icon bundle: " + err.Error())
+				}
+				break // Stop after first match
+			}
+		}
+	}
+
+	// Finalize: Update Plist or Fallback
+	if useLiquidGlass {
+		// Inject CFBundleIconName
+		plistPath := filepath.Join(contentsDirectory, "Info.plist")
+		err = updatePlistWithIconName(plistPath, iconName)
+		if err != nil {
+			return errors.Wrap(err, "Failed to update Info.plist with CFBundleIconName")
+		}
+	} else {
+		// Legacy: Generate .icns from .png
+		err = processDarwinIcon(options.ProjectData, "appicon", resourceDir, "iconfile")
+		if err != nil {
+			return err
+		}
 	}
 
 	// Generate FileAssociation Icons
@@ -112,6 +192,64 @@ func packageApplicationForDarwin(options *Options) error {
 	options.CompiledBinary = packedBinaryPath
 
 	return nil
+}
+
+const BundledAppIconName = "AppIcon"
+
+// Reference logic: https://github.com/electron/packager/pull/1806/files
+func compileAssetsCar(sourceDir string, targetDir string, iconName string) error {
+	// actool logic
+	// Command: actool sourceDir --compile targetDir --app-icon iconName ...
+
+	// We need to check if actool exists
+	_, err := exec.LookPath("actool")
+	if err != nil {
+		return fmt.Errorf("actool not found. Xcode Command Line Tools required for .icon support")
+	}
+
+	// We need a path for the partial info plist, otherwise actool might not emit the car file
+	partialPlist := filepath.Join(filepath.Dir(targetDir), "assetcatalog_generated_info.plist")
+
+	cmd := exec.Command("actool", sourceDir, "--compile", targetDir, "--output-partial-info-plist", partialPlist, "--app-icon", iconName, "--platform", "macosx", "--minimum-deployment-target", "11.0", "--target-device", "mac")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("actool failed: %s, output: %s", err, string(output))
+	}
+	return nil
+}
+
+func updatePlistWithIconName(plistPath string, iconName string) error {
+	content, err := os.ReadFile(plistPath)
+	if err != nil {
+		return err
+	}
+
+	// Inject CFBundleIconName into Info.plist
+	// We inject this manually to avoid introducing complex Plist parsing dependencies
+	// for this single field.
+
+	// Check if the key already exists (e.g. from the template).
+	// If so, we assume it is correct and do not overwrite it.
+	sContent := string(content)
+	if strings.Contains(sContent, "<key>CFBundleIconName</key>") {
+		return nil
+	}
+
+	// Inject key
+	injection := fmt.Sprintf("\t<key>CFBundleIconName</key>\n\t<string>%s</string>\n", iconName)
+
+	// Remove legacy CFBundleIconFile if present to force usage of Asset Catalog
+	re := regexp.MustCompile(`\s*<key>CFBundleIconFile</key>\s*<string>.*?</string>`)
+	sContent = re.ReplaceAllString(sContent, "")
+
+	// Find last </dict>
+	lastDict := strings.LastIndex(sContent, "</dict>")
+	if lastDict == -1 {
+		return fmt.Errorf("invalid Info.plist format")
+	}
+
+	newContent := sContent[:lastDict] + injection + sContent[lastDict:]
+	return os.WriteFile(plistPath, []byte(newContent), 0644)
 }
 
 func processPList(options *Options, contentsDirectory string) error {
